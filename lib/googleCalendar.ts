@@ -10,6 +10,9 @@ export type GoogleEventInput = {
   end: string;   // ISO 8601 local
   timeZone?: string;
   reminderMinutes?: number | null;
+  colorId?: string; // 1-11
+  location?: string;
+  source?: { title: string; url: string };
 };
 
 function tzGuess() {
@@ -28,6 +31,9 @@ function buildBody(ev: GoogleEventInput) {
     start: { dateTime: ev.start, timeZone: tz },
     end: { dateTime: ev.end, timeZone: tz },
   };
+  if (ev.colorId) body.colorId = ev.colorId;
+  if (ev.location) body.location = ev.location;
+  if (ev.source) body.source = ev.source;
   if (ev.reminderMinutes && ev.reminderMinutes > 0) {
     body.reminders = {
       useDefault: false,
@@ -72,5 +78,53 @@ export async function updateGoogleEvent(id: string, ev: GoogleEventInput): Promi
 export async function deleteGoogleEvent(id: string): Promise<void> {
   await authedFetch(`/calendars/primary/events/${encodeURIComponent(id)}`, {
     method: 'DELETE',
+  });
+}
+
+export type RemoteEvent = {
+  id: string;
+  summary: string;
+  description: string;
+  start: string; // ISO local
+  end: string;
+  reminderMinutes: number | null;
+  cancelled: boolean;
+};
+
+// Lista todos os eventos sincronizados pelo Agenda Gomes (filtra pelo marker na descricao).
+// Inclui eventos cancelados (deletados) para podermos detectar exclusoes.
+export async function listOurGoogleEvents(opts?: {
+  timeMin?: string;
+  timeMax?: string;
+}): Promise<RemoteEvent[]> {
+  const now = new Date();
+  const past = new Date(now);
+  past.setDate(past.getDate() - 90);
+  const future = new Date(now);
+  future.setFullYear(future.getFullYear() + 2);
+
+  const params = new URLSearchParams({
+    timeMin: opts?.timeMin ?? past.toISOString(),
+    timeMax: opts?.timeMax ?? future.toISOString(),
+    showDeleted: 'true',
+    singleEvents: 'true',
+    maxResults: '500',
+    q: 'Sincronizado pelo Agenda Gomes',
+  });
+
+  const data = await authedFetch(`/calendars/primary/events?${params.toString()}`);
+  const items = (data?.items ?? []) as any[];
+  return items.map((ev) => {
+    const reminderMin =
+      ev.reminders?.overrides?.find((o: any) => o.method === 'popup')?.minutes ?? null;
+    return {
+      id: ev.id,
+      summary: ev.summary ?? '',
+      description: ev.description ?? '',
+      start: ev.start?.dateTime ?? ev.start?.date ?? '',
+      end: ev.end?.dateTime ?? ev.end?.date ?? '',
+      reminderMinutes: reminderMin,
+      cancelled: ev.status === 'cancelled',
+    } as RemoteEvent;
   });
 }

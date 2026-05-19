@@ -17,8 +17,10 @@ import { getGoogleUserEmail, googleSignIn, googleSignOut } from './lib/googleAut
 import {
   deleteItemFromGoogle,
   deleteItemFromMicrosoft,
+  pullFromGoogle,
   syncItemToGoogle,
   syncItemToMicrosoft,
+  type SyncableItem,
 } from './lib/syncEngine';
 import { integrationsEnabled } from './lib/syncConfig';
 
@@ -368,6 +370,25 @@ const darkColors: Colors = {
   sidebarBg: '#262626',
 };
 
+function enrichForSync(item: AgendaItem, lists: TaskList[]): SyncableItem {
+  const list = lists.find((l) => l.id === item.listId);
+  return {
+    id: item.id,
+    title: item.title,
+    notes: item.notes,
+    date: item.date,
+    time: item.time,
+    remind: item.remind,
+    msEventId: item.msEventId,
+    googleEventId: item.googleEventId,
+    listName: list?.name,
+    listEmoji: list?.emoji,
+    listColor: list?.color,
+    hashtags: extractHashtags(item),
+    steps: item.steps?.map((s) => ({ text: s.text, done: s.done })) ?? [],
+  };
+}
+
 function migrateItems(raw: any[]): AgendaItem[] {
   return raw.map((it: any, idx: number) => {
     const listId =
@@ -442,6 +463,9 @@ export default function App() {
   const [googleEmail, setGoogleEmail] = useState<string | null>(null);
   const [syncBusy, setSyncBusy] = useState(false);
   const prevItemsRef = useRef<AgendaItem[]>([]);
+  const itemsRef = useRef<AgendaItem[]>(items);
+  const listsRef = useRef<TaskList[]>(lists);
+  const initialPushDone = useRef(false);
 
   const colors = theme === 'dark' ? darkColors : lightColors;
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -523,6 +547,82 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
+  useEffect(() => {
+    listsRef.current = lists;
+  }, [lists]);
+
+  // Initial push: quando o usuario conecta o Google, envia todas as tarefas com data
+  // que ainda nao tem googleEventId (ex.: as que existiam antes do login).
+  useEffect(() => {
+    if (Platform.OS !== 'web') return;
+    if (!loaded || !googleEmail || !integrationsEnabled.google()) {
+      if (!googleEmail) initialPushDone.current = false;
+      return;
+    }
+    if (initialPushDone.current) return;
+    initialPushDone.current = true;
+
+    const todo = items.filter((i) => !i.googleEventId && parseItemDate(i.date));
+    if (todo.length === 0) return;
+
+    setSyncBusy(true);
+    (async () => {
+      for (const it of todo) {
+        const enriched = enrichForSync(it, listsRef.current);
+        const newId = await syncItemToGoogle(enriched);
+        if (newId) {
+          setItems((cur) =>
+            cur.map((x) => (x.id === it.id ? { ...x, googleEventId: newId } : x))
+          );
+        }
+      }
+      setSyncBusy(false);
+    })();
+  }, [googleEmail, loaded, items]);
+
+  // Pull from Google: detecta exclusoes e mudancas de titulo feitas na agenda.
+  // Roda no login, a cada 60s e quando a aba volta a ficar visivel.
+  useEffect(() => {
+    if (Platform.OS !== 'web') return;
+    if (!loaded || !googleEmail || !integrationsEnabled.google()) return;
+
+    let cancelled = false;
+    const run = async () => {
+      const enriched = itemsRef.current.map((it) => enrichForSync(it, listsRef.current));
+      const result = await pullFromGoogle(enriched);
+      if (cancelled) return;
+      if (result.deletedLocalIds.length > 0) {
+        setItems((cur) => cur.filter((x) => !result.deletedLocalIds.includes(x.id)));
+        setBackupMessage(`${result.deletedLocalIds.length} tarefa(s) removida(s) (excluídas no Google).`);
+        setTimeout(() => setBackupMessage(''), 4000);
+      }
+      for (const u of result.updates) {
+        setItems((cur) =>
+          cur.map((x) => (x.id === u.id ? { ...x, ...(u.changes as Partial<AgendaItem>) } : x))
+        );
+      }
+    };
+
+    run();
+    const interval = setInterval(run, 60000);
+    const onVis = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') run();
+    };
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVis);
+    }
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVis);
+      }
+    };
+  }, [googleEmail, loaded]);
+
+  useEffect(() => {
     if (!loaded) {
       prevItemsRef.current = items;
       return;
@@ -566,14 +666,15 @@ export default function App() {
     setSyncBusy(true);
     (async () => {
       for (const it of work) {
+        const enriched = enrichForSync(it, listsRef.current);
         if (msActive) {
-          const newId = await syncItemToMicrosoft(it);
+          const newId = await syncItemToMicrosoft(enriched);
           if (newId && newId !== it.msEventId) {
             setItems((cur) => cur.map((x) => (x.id === it.id ? { ...x, msEventId: newId } : x)));
           }
         }
         if (googleActive) {
-          const newId = await syncItemToGoogle(it);
+          const newId = await syncItemToGoogle(enriched);
           if (newId && newId !== it.googleEventId) {
             setItems((cur) =>
               cur.map((x) => (x.id === it.id ? { ...x, googleEventId: newId } : x))
@@ -582,8 +683,9 @@ export default function App() {
         }
       }
       for (const it of deleted) {
-        if (msActive) await deleteItemFromMicrosoft(it);
-        if (googleActive) await deleteItemFromGoogle(it);
+        const enriched = enrichForSync(it, listsRef.current);
+        if (msActive) await deleteItemFromMicrosoft(enriched);
+        if (googleActive) await deleteItemFromGoogle(enriched);
       }
       setSyncBusy(false);
     })();

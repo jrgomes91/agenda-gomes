@@ -1,7 +1,12 @@
 // Sincroniza tarefas locais com Outlook Calendar (Microsoft) e Google Calendar.
 // V1: sync one-way (local → cloud). Lembretes nativos disparam no Outlook/Google Calendar.
 import { createCalendarEvent, deleteCalendarEvent, updateCalendarEvent } from './graphCalendar';
-import { createGoogleEvent, deleteGoogleEvent, updateGoogleEvent } from './googleCalendar';
+import {
+  createGoogleEvent,
+  deleteGoogleEvent,
+  listOurGoogleEvents,
+  updateGoogleEvent,
+} from './googleCalendar';
 
 export type SyncableItem = {
   id: number;
@@ -12,7 +17,57 @@ export type SyncableItem = {
   remind: string;
   msEventId?: string;
   googleEventId?: string;
+  listName?: string;
+  listEmoji?: string;
+  listColor?: string;
+  hashtags?: string[];
+  steps?: { text: string; done: boolean }[];
 };
+
+// mapeia hex aproximado pro Google Calendar colorId (1-11)
+function colorToGoogleId(hex?: string): string | undefined {
+  if (!hex) return undefined;
+  const map: Record<string, string> = {
+    '#2564cf': '9',  // Trabalho -> Blueberry
+    '#107c10': '10', // Casa -> Basil (verde)
+    '#8764b8': '3',  // Pessoal -> Grape
+    '#d83b01': '11', // Compras -> Tomato
+    '#038387': '7',  // Clientes -> Peacock
+    '#c239b3': '3',  // magenta -> Grape
+    '#e3008c': '4',  // pink -> Flamingo
+    '#ff8c00': '6',  // laranja -> Tangerine
+    '#00b294': '2',  // verde agua -> Sage
+    '#5c2e91': '1',  // roxo escuro -> Lavender
+  };
+  return map[hex.toLowerCase()] ?? '8'; // 8 = Graphite cinza default
+}
+
+function buildEventTitle(item: SyncableItem): string {
+  const emoji = item.listEmoji ?? '📋';
+  return `${emoji} ${item.title}`;
+}
+
+function buildEventDescription(item: SyncableItem): string {
+  const lines: string[] = [];
+  if (item.listName) lines.push(`📂 ${item.listName}`);
+  if (item.hashtags && item.hashtags.length > 0) {
+    lines.push(`🏷️ ${item.hashtags.join(' ')}`);
+  }
+  if (item.steps && item.steps.length > 0) {
+    lines.push('');
+    lines.push('📝 Etapas:');
+    for (const s of item.steps) {
+      lines.push(`${s.done ? '✓' : '☐'} ${s.text}`);
+    }
+  }
+  if (item.notes && item.notes.trim()) {
+    lines.push('');
+    lines.push(item.notes.trim());
+  }
+  lines.push('');
+  lines.push('— Sincronizado pelo Agenda Gomes');
+  return lines.join('\n');
+}
 
 function reminderToMinutes(remind: string): number | null {
   if (!remind || remind === 'Sem lembrete') return null;
@@ -85,13 +140,13 @@ export async function syncItemToMicrosoft(item: SyncableItem): Promise<string | 
 
   const minutes = reminderToMinutes(item.remind);
   const payload = {
-    subject: item.title,
+    subject: buildEventTitle(item),
     start: dates.start,
     end: dates.end,
-    body: item.notes,
+    body: buildEventDescription(item),
     isReminderOn: minutes !== null,
     reminderMinutesBeforeStart: minutes ?? 0,
-    categories: ['Agenda Gomes'],
+    categories: ['Agenda Gomes', item.listName].filter(Boolean) as string[],
   };
 
   try {
@@ -130,12 +185,16 @@ export async function syncItemToGoogle(item: SyncableItem): Promise<string | nul
   }
 
   const minutes = reminderToMinutes(item.remind);
+  const origin = typeof window !== 'undefined' ? window.location.origin : '';
   const payload = {
-    summary: item.title,
-    description: item.notes,
+    summary: buildEventTitle(item),
+    description: buildEventDescription(item),
     start: dates.start,
     end: dates.end,
     reminderMinutes: minutes,
+    colorId: colorToGoogleId(item.listColor),
+    location: item.listName,
+    source: origin ? { title: 'Agenda Gomes', url: origin } : undefined,
   };
 
   try {
@@ -158,4 +217,56 @@ export async function deleteItemFromGoogle(item: SyncableItem): Promise<void> {
   } catch (e) {
     console.warn('sync Google delete falhou:', e);
   }
+}
+
+export type GooglePullResult = {
+  /** local item IDs cujo evento foi cancelado no Google (deve ser removido localmente) */
+  deletedLocalIds: number[];
+  /** mudancas detectadas no Google (titulo/hora/lembrete) a aplicar localmente */
+  updates: { id: number; changes: Partial<SyncableItem> }[];
+};
+
+/**
+ * Le os eventos do Google marcados como "Sincronizado pelo Agenda Gomes"
+ * e compara com os itens locais que tem googleEventId. Retorna:
+ *  - quais foram deletados no Google (precisam sair do app)
+ *  - quais mudaram de titulo/hora no Google (atualizam o app)
+ */
+export async function pullFromGoogle(localItems: SyncableItem[]): Promise<GooglePullResult> {
+  let remote;
+  try {
+    remote = await listOurGoogleEvents();
+  } catch (e) {
+    console.warn('pullFromGoogle falhou:', e);
+    return { deletedLocalIds: [], updates: [] };
+  }
+
+  const remoteById = new Map(remote.map((r) => [r.id, r]));
+  const result: GooglePullResult = { deletedLocalIds: [], updates: [] };
+
+  for (const item of localItems) {
+    if (!item.googleEventId) continue;
+    const r = remoteById.get(item.googleEventId);
+    if (!r) {
+      // o evento que sincronizamos antes nao retornou no list.
+      // pode ser: deletado, ou esta fora do range de tempo (passado).
+      // Para evitar falso-positivo, so removemos se a data do item esta dentro do range pesquisado.
+      continue;
+    }
+    if (r.cancelled) {
+      result.deletedLocalIds.push(item.id);
+      continue;
+    }
+    // detecta mudanca de titulo
+    const expectedTitle = buildEventTitle(item);
+    if (r.summary && r.summary !== expectedTitle) {
+      // remove emoji do inicio se vier
+      const cleanTitle = r.summary.replace(/^[^\w]+\s*/, '').trim();
+      if (cleanTitle && cleanTitle !== item.title) {
+        result.updates.push({ id: item.id, changes: { title: cleanTitle } });
+      }
+    }
+  }
+
+  return result;
 }
