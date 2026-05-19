@@ -12,6 +12,15 @@ import {
   useWindowDimensions,
   View,
 } from 'react-native';
+import { ensureMsInitialized, getMsAccount, msSignIn, msSignOut } from './lib/msAuth';
+import { getGoogleUserEmail, googleSignIn, googleSignOut } from './lib/googleAuth';
+import {
+  deleteItemFromGoogle,
+  deleteItemFromMicrosoft,
+  syncItemToGoogle,
+  syncItemToMicrosoft,
+} from './lib/syncEngine';
+import { integrationsEnabled } from './lib/syncConfig';
 
 type Step = { id: string; text: string; done: boolean };
 type Attachment = { id: string; name: string; size?: number; dataUrl?: string };
@@ -31,6 +40,8 @@ type AgendaItem = {
   notes: string;
   status: 'Pendente' | 'Confirmado' | 'Concluido';
   createdAt: number;
+  msEventId?: string;
+  googleEventId?: string;
 };
 
 type TaskList = {
@@ -427,6 +438,10 @@ export default function App() {
   const pendingAttachItemId = useRef<number | null>(null);
   const [installPrompt, setInstallPrompt] = useState<any>(null);
   const [backupMessage, setBackupMessage] = useState('');
+  const [msEmail, setMsEmail] = useState<string | null>(null);
+  const [googleEmail, setGoogleEmail] = useState<string | null>(null);
+  const [syncBusy, setSyncBusy] = useState(false);
+  const prevItemsRef = useRef<AgendaItem[]>([]);
 
   const colors = theme === 'dark' ? darkColors : lightColors;
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -493,6 +508,87 @@ export default function App() {
     win.addEventListener('beforeinstallprompt', handler);
     return () => win.removeEventListener('beforeinstallprompt', handler);
   }, []);
+
+  useEffect(() => {
+    if (Platform.OS !== 'web') return;
+    if (integrationsEnabled.microsoft()) {
+      ensureMsInitialized().then(() => {
+        const acc = getMsAccount();
+        setMsEmail(acc?.username ?? null);
+      });
+    }
+    if (integrationsEnabled.google()) {
+      setGoogleEmail(getGoogleUserEmail());
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) {
+      prevItemsRef.current = items;
+      return;
+    }
+    const msActive = !!msEmail && integrationsEnabled.microsoft();
+    const googleActive = !!googleEmail && integrationsEnabled.google();
+    if (!msActive && !googleActive) {
+      prevItemsRef.current = items;
+      return;
+    }
+    const prev = prevItemsRef.current;
+    const prevById = new Map(prev.map((it) => [it.id, it]));
+    const currentIds = new Set(items.map((it) => it.id));
+
+    const created: AgendaItem[] = [];
+    const updated: AgendaItem[] = [];
+    for (const it of items) {
+      const before = prevById.get(it.id);
+      if (!before) {
+        created.push(it);
+        continue;
+      }
+      if (
+        before.title !== it.title ||
+        before.date !== it.date ||
+        before.time !== it.time ||
+        before.remind !== it.remind ||
+        before.notes !== it.notes
+      ) {
+        updated.push(it);
+      }
+    }
+    const deleted = prev.filter((it) => !currentIds.has(it.id));
+
+    const work = [...created, ...updated];
+    if (work.length === 0 && deleted.length === 0) {
+      prevItemsRef.current = items;
+      return;
+    }
+
+    setSyncBusy(true);
+    (async () => {
+      for (const it of work) {
+        if (msActive) {
+          const newId = await syncItemToMicrosoft(it);
+          if (newId && newId !== it.msEventId) {
+            setItems((cur) => cur.map((x) => (x.id === it.id ? { ...x, msEventId: newId } : x)));
+          }
+        }
+        if (googleActive) {
+          const newId = await syncItemToGoogle(it);
+          if (newId && newId !== it.googleEventId) {
+            setItems((cur) =>
+              cur.map((x) => (x.id === it.id ? { ...x, googleEventId: newId } : x))
+            );
+          }
+        }
+      }
+      for (const it of deleted) {
+        if (msActive) await deleteItemFromMicrosoft(it);
+        if (googleActive) await deleteItemFromGoogle(it);
+      }
+      setSyncBusy(false);
+    })();
+    prevItemsRef.current = items;
+  }, [items, loaded, msEmail, googleEmail]);
 
   useEffect(() => {
     const notificationApi = typeof globalThis !== 'undefined' ? globalThis.Notification : undefined;
@@ -953,6 +1049,51 @@ export default function App() {
                   <Pressable onPress={pickBackupFile} style={styles.penButton}>
                     <Text style={styles.penButtonText}>📥 Importar</Text>
                   </Pressable>
+                  {integrationsEnabled.microsoft() && (
+                    msEmail ? (
+                      <Pressable
+                        onPress={() => msSignOut().then(() => setMsEmail(null))}
+                        style={styles.penButton}
+                      >
+                        <Text style={styles.penButtonText}>
+                          {syncBusy ? '⏳' : '✓'} MS: {msEmail.split('@')[0]}
+                        </Text>
+                      </Pressable>
+                    ) : (
+                      <Pressable onPress={() => msSignIn()} style={styles.penButton}>
+                        <Text style={styles.penButtonText}>🔗 Conectar Microsoft</Text>
+                      </Pressable>
+                    )
+                  )}
+                  {integrationsEnabled.google() && (
+                    googleEmail ? (
+                      <Pressable
+                        onPress={() => {
+                          googleSignOut();
+                          setGoogleEmail(null);
+                        }}
+                        style={styles.penButton}
+                      >
+                        <Text style={styles.penButtonText}>
+                          {syncBusy ? '⏳' : '✓'} G: {googleEmail.split('@')[0]}
+                        </Text>
+                      </Pressable>
+                    ) : (
+                      <Pressable
+                        onPress={() => {
+                          googleSignIn()
+                            .then(() => setGoogleEmail(getGoogleUserEmail()))
+                            .catch((e) => {
+                              setBackupMessage('Login Google falhou: ' + (e?.message ?? ''));
+                              setTimeout(() => setBackupMessage(''), 4000);
+                            });
+                        }}
+                        style={styles.penButton}
+                      >
+                        <Text style={styles.penButtonText}>🔗 Conectar Google</Text>
+                      </Pressable>
+                    )
+                  )}
                 </>
               )}
             </View>
